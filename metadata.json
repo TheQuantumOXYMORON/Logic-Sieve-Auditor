@@ -1,0 +1,5 @@
+{
+  "name": "Logic Sieve",
+  "description": "A Logic & Ambiguity Auditor for examination questions. Identifies implied context, undefined variables, and guesswork traps to ensure logical soundness.",
+  "requestFramePermissions": []
+}
