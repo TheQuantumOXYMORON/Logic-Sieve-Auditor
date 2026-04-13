@@ -32,4 +32,4 @@ This app identifies the following "Logic Traps":
 The app utilizes a **Deterministic Engine** powered by **Gemini 1.5 Pro**. It was developed using **Vibe Coding** in **Google AI Studio** as part of the Google AI Professional Certificate.
 
 ## 📸 Screenshots
-![Logic Sieve Dashboard](link-to-your-image.png)
+![Logic Sieve Dashboard](https://github.com/TheQuantumOXYMORON/Logic-Sieve-Auditor/blob/main/Logic%20Sieve.png)
