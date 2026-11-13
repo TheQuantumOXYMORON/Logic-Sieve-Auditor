@@ -4,7 +4,6 @@
  */
 
 import { useState } from 'react';
-import { GoogleGenAI, Type } from "@google/genai";
 import { 
   AlertTriangle, 
   CheckCircle2, 
@@ -19,9 +18,6 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-// Initialize Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
 interface RedFlag {
   flag: string;
   definition: string;
@@ -33,7 +29,33 @@ interface AuditResult {
   fairnessScore: number;
   reDraft: string;
   isLogicallyVoid: boolean;
+  verdictRule?: string;
   logicalAssessment: string;
+}
+
+function isValidClientAuditResult(data: unknown): data is AuditResult {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  const obj = data as Record<string, unknown>;
+  if (!Array.isArray(obj.redFlags)) return false;
+  if (typeof obj.fairnessScore !== 'number' || !Number.isFinite(obj.fairnessScore)) {
+    return false;
+  }
+  if (typeof obj.reDraft !== 'string' || !obj.reDraft.trim()) return false;
+  if (typeof obj.logicalAssessment !== 'string' || !obj.logicalAssessment.trim()) {
+    return false;
+  }
+  if (typeof obj.isLogicallyVoid !== 'boolean') return false;
+  return obj.redFlags.every((item) => {
+    if (!item || typeof item !== 'object') return false;
+    const f = item as Record<string, unknown>;
+    return (
+      typeof f.flag === 'string' &&
+      f.flag.trim().length > 0 &&
+      typeof f.definition === 'string' &&
+      f.definition.trim().length > 0 &&
+      (f.severity === 'high' || f.severity === 'medium' || f.severity === 'low')
+    );
+  });
 }
 
 export default function App() {
@@ -49,6 +71,52 @@ export default function App() {
     setAnswers(newAnswers);
   };
 
+  const toFriendlyClientError = (rawMessage: string | undefined, status?: number): string => {
+    const trimmed = (rawMessage ?? '').trim();
+
+    if (!trimmed) {
+      return 'We could not complete the audit right now. Your inputs are saved—please click Retry to try again.';
+    }
+
+    const upper = trimmed.toUpperCase();
+    const looksLikeRawJson =
+      trimmed.startsWith('{') ||
+      trimmed.startsWith('[') ||
+      trimmed.includes('"error"') ||
+      trimmed.includes('"status"');
+
+    if (
+      status === 503 ||
+      upper.includes('UNAVAILABLE') ||
+      upper.includes('HIGH DEMAND') ||
+      upper.includes('OVERLOADED')
+    ) {
+      return 'The audit service is currently experiencing high demand. Your question and answers are saved—please wait a moment and click Retry.';
+    }
+
+    if (
+      status === 429 ||
+      upper.includes('RESOURCE_EXHAUSTED') ||
+      upper.includes('RATE LIMIT') ||
+      upper.includes('TOO MANY')
+    ) {
+      return 'The audit service reached a temporary rate limit. Your inputs are saved—please wait a few seconds and click Retry.';
+    }
+
+    if (
+      looksLikeRawJson ||
+      upper.includes('FAILED TO FETCH') ||
+      upper.includes('NETWORKERROR') ||
+      upper.includes('SERVER RESPONDED WITH STATUS')
+    ) {
+      return 'We could not reach the audit service right now. Your question and answers are still here—please click Retry in a moment.';
+    }
+
+    return trimmed;
+  };
+
+  const canRetry = Boolean(question.trim() || answers.some((a) => a.trim()));
+
   const runAudit = async () => {
     if (!question.trim() && answers.every(a => !a.trim())) {
       setError('Please enter a question or at least one answer to audit.');
@@ -57,62 +125,39 @@ export default function App() {
 
     setIsAuditing(true);
     setError(null);
-    setResult(null);
 
     try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: `
-          Audit the following examination question and its provided answers for logic gaps, implied context, undefined variables, and guesswork traps.
-          
-          Question: "${question || '[No question provided]'}"
-          Answers:
-          ${answers.map((a, i) => `${i + 1}. ${a || '[Empty]'}`).join('\n')}
-
-          Your goal:
-          1. Identify "Hazardous Assumptions" and "Guesswork Traps".
-          2. Flag terms that aren't explicitly defined.
-          3. Identify where a student must guess the examiner's environment/intent.
-          4. If the question is fundamentally flawed such that a student must guess to find the 'correct' answer, mark it as LOGICALLY VOID.
-          5. Provide a "Fairness Score" (1-100).
-          6. Provide a "Re-Draft" that is factually deterministic.
-          7. For each flag, provide a clear definition of the logical fallacy or issue.
-          8. Provide a "Logical Assessment": A brief paragraph summarizing the logical relationship between the question and answers, even if no major red flags are found. If the question is missing, assess the logical consistency of the answers themselves.
-
-          Return the result in JSON format.
-        `,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              redFlags: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    flag: { type: Type.STRING, description: "The specific issue identified (e.g., Implied Platform)." },
-                    definition: { type: Type.STRING, description: "Definition of the fallacy or logic gap." },
-                    severity: { type: Type.STRING, enum: ["high", "medium", "low"] }
-                  },
-                  required: ["flag", "definition", "severity"]
-                }
-              },
-              fairnessScore: { type: Type.NUMBER, description: "Rating from 1-100." },
-              reDraft: { type: Type.STRING, description: "A deterministic version of the question." },
-              isLogicallyVoid: { type: Type.BOOLEAN, description: "True if the question is fundamentally flawed." },
-              logicalAssessment: { type: Type.STRING, description: "A brief logical assessment of the inputs." }
-            },
-            required: ["redFlags", "fairnessScore", "reDraft", "isLogicallyVoid", "logicalAssessment"]
-          }
-        }
+      const response = await fetch('/api/audit', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          question,
+          answers,
+        }),
       });
 
-      const auditData = JSON.parse(response.text || '{}') as AuditResult;
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        const serverMessage =
+          typeof errorData?.error === 'string' ? errorData.error : undefined;
+        setError(toFriendlyClientError(serverMessage, response.status));
+        return;
+      }
+
+      const auditData: unknown = await response.json();
+      if (!isValidClientAuditResult(auditData)) {
+        setError(
+          'The audit response could not be read cleanly. Your inputs are saved—please click Retry Audit.'
+        );
+        return;
+      }
       setResult(auditData);
-    } catch (err) {
+    } catch (err: unknown) {
       console.error('Audit failed:', err);
-      setError('The audit process encountered an error. Please try again.');
+      const raw = err instanceof Error ? err.message : undefined;
+      setError(toFriendlyClientError(raw));
     } finally {
       setIsAuditing(false);
     }
@@ -159,9 +204,12 @@ export default function App() {
           </section>
 
           <section className="space-y-4">
-            <div className="flex items-center gap-2 border-b border-[#141414] pb-2">
-              <CheckCircle2 className="w-4 h-4" />
-              <h2 className="text-sm font-bold uppercase tracking-wider font-mono">Input: Provided Answers</h2>
+            <div className="flex items-center justify-between border-b border-[#141414] pb-2">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4" />
+                <h2 className="text-sm font-bold uppercase tracking-wider font-mono">Input: Provided Answers</h2>
+              </div>
+              <span className="text-[10px] uppercase font-mono opacity-50">Blank slots ignored</span>
             </div>
             <div className="grid grid-cols-1 gap-3">
               {answers.map((answer, index) => (
@@ -213,10 +261,31 @@ export default function App() {
             <motion.div 
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              className="p-4 bg-red-100 border border-red-400 text-red-700 text-sm flex items-start gap-3"
+              role="alert"
+              className="p-4 bg-red-50 border border-[#141414] text-[#141414] text-sm space-y-3"
             >
-              <AlertCircle className="w-5 h-5 shrink-0" />
-              <p>{error}</p>
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-red-700 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-mono text-xs font-bold uppercase tracking-wider text-red-800">
+                    {canRetry ? 'Audit Temporarily Unavailable' : 'Input Required'}
+                  </p>
+                  <p className="text-sm leading-relaxed text-[#141414]/90">{error}</p>
+                </div>
+              </div>
+              {canRetry && (
+                <div className="flex justify-end pt-1">
+                  <button
+                    type="button"
+                    onClick={runAudit}
+                    disabled={isAuditing}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-[#141414] text-[#E4E3E0] text-xs font-mono uppercase tracking-wider hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isAuditing ? 'animate-spin' : ''}`} />
+                    <span>Retry Audit</span>
+                  </button>
+                </div>
+              )}
             </motion.div>
           )}
         </div>
@@ -286,9 +355,10 @@ export default function App() {
                       <span className="text-6xl font-serif italic font-bold">{result.fairnessScore}</span>
                       <span className="text-xs opacity-50 font-mono self-end mb-2">/100</span>
                     </div>
+                    <span className="text-[10px] uppercase font-mono opacity-45">AI-Estimated Rating</span>
                   </div>
                   <div className={`border border-[#141414] p-6 flex flex-col items-center justify-center text-center space-y-2 ${result.isLogicallyVoid ? 'bg-red-50' : 'bg-green-50'}`}>
-                    <span className="text-[10px] uppercase font-mono opacity-50 tracking-widest">Audit Status</span>
+                    <span className="text-[10px] uppercase font-mono opacity-50 tracking-widest">Audit Status (Rule-Based)</span>
                     {result.isLogicallyVoid ? (
                       <>
                         <ShieldAlert className="w-12 h-12 text-red-600" />
@@ -300,6 +370,12 @@ export default function App() {
                         <span className="text-xl font-bold uppercase tracking-tighter text-green-600">Audit Passed</span>
                       </>
                     )}
+                    <span className="text-[10px] font-mono opacity-60 leading-snug">
+                      {result.verdictRule ??
+                        (result.isLogicallyVoid
+                          ? 'Rule: Void (≥ 1 high-severity flag)'
+                          : 'Rule: Passed (0 high-severity flags)')}
+                    </span>
                   </div>
                 </div>
 
@@ -338,8 +414,17 @@ export default function App() {
                             }`}>
                               <AlertTriangle className="w-4 h-4" />
                             </div>
-                            <div className="space-y-1">
-                              <h4 className="font-bold uppercase tracking-tight text-sm">Flag: {flag.flag}</h4>
+                            <div className="space-y-1 flex-1">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <h4 className="font-bold uppercase tracking-tight text-sm">Flag: {flag.flag}</h4>
+                                <span className={`text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 border border-[#141414]/30 group-hover:border-[#E4E3E0]/40 ${
+                                  flag.severity === 'high' ? 'text-red-700 group-hover:text-red-300' :
+                                  flag.severity === 'medium' ? 'text-orange-700 group-hover:text-orange-300' :
+                                  'text-blue-700 group-hover:text-blue-300'
+                                }`}>
+                                  {flag.severity} severity
+                                </span>
+                              </div>
                               <p className="text-xs opacity-70 leading-relaxed font-mono">{flag.definition}</p>
                             </div>
                           </div>
@@ -357,7 +442,7 @@ export default function App() {
                 <section className="space-y-4">
                   <div className="flex items-center gap-2 border-b border-[#141414] pb-2">
                     <RefreshCw className="w-4 h-4" />
-                    <h2 className="text-sm font-bold uppercase tracking-wider font-mono">Deterministic Re-Draft</h2>
+                    <h2 className="text-sm font-bold uppercase tracking-wider font-mono">Suggested Re-Draft</h2>
                   </div>
                   <div className="p-6 border border-[#141414] bg-white relative overflow-hidden group">
                     <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
@@ -368,7 +453,7 @@ export default function App() {
                     </p>
                     <div className="mt-4 flex items-center gap-2 text-[10px] uppercase font-mono opacity-40">
                       <ArrowRight className="w-3 h-3" />
-                      <span>This version removes implied context and defines all variables.</span>
+                      <span>AI-suggested rewrite aiming to make implied context and variables explicit.</span>
                     </div>
                   </div>
                 </section>
@@ -387,8 +472,8 @@ export default function App() {
           </div>
           <div className="flex gap-8 text-[10px] uppercase tracking-widest font-mono opacity-50">
             <span>© 2026 Logic Sieve</span>
-            <span>Security Verified</span>
-            <span>Deterministic Engine</span>
+            <span>Rule-Based Verdict</span>
+            <span>AI-Assisted Audit</span>
           </div>
         </div>
       </footer>
